@@ -1,0 +1,28 @@
+# 敏感配置(含 app_secret,只提交 config.example.json)
+config.json
+
+# 运行日志(含 access_key / ticket 等会话凭证)
+*.log
+
+# 任务台账运行产物(含指令与执行结果)
+tasks.jsonl
+state/
+
+# Python 虚拟环境
+venv/
+.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# whisper 模型缓存(体积大)
+*.bin
+
+# macOS
+.DS_Store
+
+# 机器专属 launchd(含用户名/路径),只提交 com.example.*.plist 模板
+com.*.feishu-voice-claude.plist
+!com.example.feishu-voice-claude.plist

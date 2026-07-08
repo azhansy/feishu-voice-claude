@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd 自启模板。使用前把下面的占位符替换成你自己的路径:
+    __INSTALL_DIR__  -> 本项目所在目录,例如 /Users/你的用户名/projects/feishu-voice-claude
+    __HOME__         -> 你的用户主目录,例如 /Users/你的用户名
+    __PROXY__        -> 代理地址(不需要就整段 EnvironmentVariables 里的代理删掉)
+  然后另存为 com.<你的名字>.feishu-voice-claude.plist 再 cp 到 ~/Library/LaunchAgents/
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.feishu-voice-claude</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__INSTALL_DIR__/venv/bin/python</string>
+    <string>__INSTALL_DIR__/bridge.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__INSTALL_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HTTP_PROXY</key>
+    <string>__PROXY__</string>
+    <key>HTTPS_PROXY</key>
+    <string>__PROXY__</string>
+    <key>ALL_PROXY</key>
+    <string>__PROXY__</string>
+    <key>NO_PROXY</key>
+    <string>localhost,127.0.0.1,::1</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__INSTALL_DIR__/bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>__INSTALL_DIR__/bridge.err.log</string>
+</dict>
+</plist>

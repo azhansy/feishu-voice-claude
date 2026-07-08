@@ -1,0 +1,76 @@
+{
+  "feishu": {
+    "app_id": "cli_填你的AppID",
+    "app_secret": "填你的AppSecret"
+  },
+  "projects_root": "/Users/YOUR_NAME/projects",
+  "default_project": "",
+  "aliases": {
+    "网页": "my-website",
+    "后端": "my-backend",
+    "应用": "my-app"
+  },
+  "whisper": {
+    "model": "small",
+    "language": "zh"
+  },
+  "claude": {
+    "bin": "/Users/YOUR_NAME/.local/bin/claude",
+    "proxy": "",
+    "no_proxy": "localhost,127.0.0.1,::1",
+    "extra_args": [
+      "--dangerously-skip-permissions"
+    ],
+    "timeout_seconds": 1800,
+    "heartbeat_seconds": 60
+  },
+  "danger": {
+    "require_confirm": true,
+    "confirm_words": [
+      "确认",
+      "确定",
+      "执行",
+      "yes",
+      "confirm",
+      "ok",
+      "好的",
+      "可以"
+    ],
+    "keywords": [
+      "删除",
+      "删库",
+      "清空",
+      "覆盖",
+      "重置",
+      "回滚",
+      "强推",
+      "丢弃",
+      "rm ",
+      "rm -",
+      "drop ",
+      "truncate",
+      "delete from",
+      "reset --hard",
+      "push -f",
+      "push --force",
+      "force",
+      "git clean",
+      "格式化",
+      "format"
+    ],
+    "cancel_words": [
+      "取消",
+      "cancel",
+      "算了",
+      "不用了",
+      "不用",
+      "不"
+    ]
+  },
+  "dashboard": {
+    "enabled": true,
+    "port": 8765,
+    "recent": 50,
+    "retain_days": 2
+  }
+}
