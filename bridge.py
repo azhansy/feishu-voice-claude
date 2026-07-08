@@ -19,6 +19,7 @@ import json
 import time
 import uuid
 import shutil
+import signal
 import tempfile
 import difflib
 import threading
@@ -57,6 +58,20 @@ def load_config():
 
 CFG = load_config()
 
+# --------------------------------------------------------------------------- #
+# 发送者鉴权:仅私聊 + open_id 白名单
+# 这是唯一的安全边界。二次确认对恶意发送者无效(确认方即发起方),必须先拦住是谁在发。
+# --------------------------------------------------------------------------- #
+_SEC = CFG.get("security", {})
+# 白名单为空 = 拒绝所有(安全默认):要先把自己的 open_id 填进 config.security.allowed_open_ids。
+# 未授权消息会在日志里打印其 open_id,方便你抓来填。
+ALLOWED_OPEN_IDS = set(_SEC.get("allowed_open_ids", []))
+ALLOW_GROUP_CHAT = bool(_SEC.get("allow_group_chat", False))
+
+
+def is_allowed_sender(open_id):
+    return bool(open_id) and open_id in ALLOWED_OPEN_IDS
+
 # 待确认任务: { chat_id: {"project": str, "instruction": str, "ts": float, "token": str} }
 PENDING = {}
 PENDING_TTL = 300  # 秒
@@ -87,6 +102,19 @@ def seen_before(eid):
 SESSIONS = {}
 SESSIONS_FILE = os.path.join(HERE, "state", "sessions.json")
 _SESSIONS_LOCK = threading.Lock()
+
+# 同一「会话+项目」的并发指令必须串行,否则两个 --resume 同一 sid 会互相覆盖 SESSIONS、上下文错乱。
+_SESSION_RUN_LOCKS = {}
+_SESSION_RUN_LOCKS_GUARD = threading.Lock()
+
+
+def _session_run_lock(key):
+    with _SESSION_RUN_LOCKS_GUARD:
+        lk = _SESSION_RUN_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _SESSION_RUN_LOCKS[key] = lk
+        return lk
 
 # 每个会话最近用过的项目,用于「不重复报项目名」的追问
 LAST_PROJECT = {}
@@ -213,8 +241,8 @@ def _cutoff_ts():
     return time.time() - RETAIN_DAYS * 86400
 
 
-def _prune_ledger():
-    """只保留最近 RETAIN_DAYS 天的历史(重写 tasks.jsonl)。"""
+def _prune_ledger_locked():
+    """只保留最近 RETAIN_DAYS 天的历史(重写 tasks.jsonl)。调用方必须已持有 _LEDGER_LOCK。"""
     try:
         if not os.path.exists(LEDGER_FILE):
             return
@@ -232,6 +260,12 @@ def _prune_ledger():
             f.writelines(kept)
     except Exception:
         pass
+
+
+def _prune_ledger():
+    """裁剪历史(自持锁版本)。读全部→重写必须在锁内,否则与 task_end 的 append 并发会丢记录。"""
+    with _LEDGER_LOCK:
+        _prune_ledger_locked()
 
 
 def _max_ledger_id():
@@ -294,7 +328,7 @@ def task_end(tid, status, seconds, result):
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
             pass
-    _prune_ledger()
+        _prune_ledger_locked()   # 与上面的 append 同处一把锁,避免并发裁剪丢记录
     icon = {"done": "✔", "error": "✖", "timeout": "⏱"}.get(status, "•")
     print(f"[task#{tid}] {icon} {status}  {round(seconds, 1)}s  [{info.get('project')}]", flush=True)
 
@@ -565,7 +599,14 @@ def run_claude(project, instruction, chat_id=None):
     按「会话+项目」维度续接 Claude 上下文:首次用 --session-id 建会话,
     之后用 --resume 续接,让连续对话能记住前文。
     """
-    cwd = os.path.join(CFG["projects_root"], project)
+    # 校验 project 合法性:必须是已知项目,且 realpath 落在 projects_root 内。
+    # 文本路由本来就安全,但卡片回调的 project 值若被伪造(如 "/etc")能逃出前缀,这里无条件拦住。
+    root = os.path.realpath(CFG["projects_root"])
+    if project not in list_projects():
+        return f"⛔ 未知项目: {project}"
+    cwd = os.path.realpath(os.path.join(CFG["projects_root"], project))
+    if cwd != root and not cwd.startswith(root + os.sep):
+        return f"⛔ 非法项目路径: {project}"
     if not os.path.isdir(cwd):
         return f"项目目录不存在: {cwd}"
 
@@ -583,57 +624,71 @@ def run_claude(project, instruction, chat_id=None):
     extra = CFG["claude"].get("extra_args", [])
     timeout = CFG["claude"].get("timeout_seconds", 1800)
 
-    key = _session_key(chat_id, project)
-    with _SESSIONS_LOCK:
-        sid = SESSIONS.get(key)
-    resuming = bool(sid)
-    if not sid:
-        sid = str(uuid.uuid4())
-
     def _invoke(session_flag):
-        return subprocess.run(base + session_flag + extra, cwd=cwd, env=env,
-                              capture_output=True, text=True, timeout=timeout)
+        # 独立进程组启动,超时时杀整个组,避免 claude 派生的孙进程残留后台。
+        proc = subprocess.Popen(base + session_flag + extra, cwd=cwd, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.communicate()
+            raise
+        return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
-    bump_usage(project)
-    tid = task_start(project, instruction)
-    t0 = time.time()
-    try:
-        if resuming:
-            proc = _invoke(["--resume", sid])
-            # 续接失败(会话可能已失效)-> 用新会话重来一次
-            if proc.returncode != 0 and not proc.stdout.strip():
-                sid = str(uuid.uuid4())
-                resuming = False
+    key = _session_key(chat_id, project)
+    # 串行化同一「会话+项目」:并发指令排队执行,避免 --resume 撞车与 SESSIONS 互相覆盖。
+    with _session_run_lock(key):
+        with _SESSIONS_LOCK:
+            sid = SESSIONS.get(key)
+        resuming = bool(sid)
+        if not sid:
+            sid = str(uuid.uuid4())
+
+        bump_usage(project)
+        tid = task_start(project, instruction)
+        t0 = time.time()
+        try:
+            if resuming:
+                proc = _invoke(["--resume", sid])
+                # 续接失败(会话可能已失效)-> 用新会话重来一次
+                if proc.returncode != 0 and not proc.stdout.strip():
+                    sid = str(uuid.uuid4())
+                    resuming = False
+                    proc = _invoke(["--session-id", sid])
+            else:
                 proc = _invoke(["--session-id", sid])
-        else:
-            proc = _invoke(["--session-id", sid])
-    except subprocess.TimeoutExpired:
-        out = "⏱️ Claude 执行超时了。"
-        task_end(tid, "timeout", time.time() - t0, out)
+        except subprocess.TimeoutExpired:
+            out = "⏱️ Claude 执行超时了。"
+            task_end(tid, "timeout", time.time() - t0, out)
+            return out
+
+        if proc.returncode != 0 and not proc.stdout.strip():
+            out = f"❌ Claude 执行失败:\n{proc.stderr.strip()[:1500]}"
+            task_end(tid, "error", time.time() - t0, out)
+            return out
+
+        # 解析 --output-format json 的结果,并记住会话 id
+        try:
+            data = json.loads(proc.stdout)
+            result = data.get("result") or data.get("text") or proc.stdout
+            sid = data.get("session_id") or sid
+        except (json.JSONDecodeError, AttributeError):
+            result = proc.stdout.strip()
+        with _SESSIONS_LOCK:
+            SESSIONS[key] = sid
+            _save_sessions()
+
+        full = result.strip()
+        out = full[:3500] or "(Claude 没有返回文本)"
+        if len(full) > 3500:
+            out += "\n\n…(结果较长已截断,完整内容见台账 http://127.0.0.1:8765 或 bridge.log)"
+        task_end(tid, "done", time.time() - t0, full or out)   # 台账存完整,Feishu 回截断版
         return out
-
-    if proc.returncode != 0 and not proc.stdout.strip():
-        out = f"❌ Claude 执行失败:\n{proc.stderr.strip()[:1500]}"
-        task_end(tid, "error", time.time() - t0, out)
-        return out
-
-    # 解析 --output-format json 的结果,并记住会话 id
-    try:
-        data = json.loads(proc.stdout)
-        result = data.get("result") or data.get("text") or proc.stdout
-        sid = data.get("session_id") or sid
-    except (json.JSONDecodeError, AttributeError):
-        result = proc.stdout.strip()
-    with _SESSIONS_LOCK:
-        SESSIONS[key] = sid
-        _save_sessions()
-
-    full = result.strip()
-    out = full[:3500] or "(Claude 没有返回文本)"
-    if len(full) > 3500:
-        out += "\n\n…(结果较长已截断,完整内容见台账 http://127.0.0.1:8765 或 bridge.log)"
-    task_end(tid, "done", time.time() - t0, full or out)   # 台账存完整,Feishu 回截断版
-    return out
 
 
 def run_and_reply(message_id, project, instruction, chat_id):
@@ -645,8 +700,10 @@ def run_and_reply(message_id, project, instruction, chat_id):
 
     def _beat():
         t0 = time.time()
-        while interval and not stop.wait(interval):
+        wait = interval
+        while interval and not stop.wait(wait):
             reply(message_id, f"⏳ 还在跑…已 {int(time.time() - t0)}s")
+            wait = min(wait * 2, 300)   # 逐步退避,30 分钟长任务从约 30 条心跳降到 ~8 条
 
     hb = threading.Thread(target=_beat, daemon=True)
     hb.start()
@@ -745,10 +802,29 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         message_id = msg.message_id
         chat_id = msg.chat_id
         mtype = msg.message_type
+        chat_type = msg.chat_type
+
+        sender = data.event.sender
+        open_id = sender.sender_id.open_id if (sender and sender.sender_id) else None
 
         # 幂等:同一条消息被飞书重投时 message_id 不变,已处理过就跳过,避免重复执行
+        # (放在鉴权之前:未授权消息的拒绝回复也只发一次,不随重投刷屏)
         if seen_before(message_id):
             print(f"[on_message] 跳过重复投递 message_id={message_id}", flush=True)
+            return
+
+        # 鉴权闸门:仅私聊 + open_id 白名单。这是唯一能挡住恶意远程执行的边界。
+        if chat_type != "p2p" and not ALLOW_GROUP_CHAT:
+            print(f"[on_message] 拒绝非私聊消息 chat_type={chat_type} open_id={open_id}", flush=True)
+            return
+        if not is_allowed_sender(open_id):
+            print(f"[on_message] 拒绝未授权发送者 open_id={open_id} "
+                  f"(把它加入 config.security.allowed_open_ids 即可放行)", flush=True)
+            if chat_type == "p2p":
+                try:
+                    reply(message_id, "⛔ 未授权:你不在允许名单内,已忽略。")
+                except Exception:
+                    pass
             return
 
         content = json.loads(msg.content)
@@ -770,6 +846,13 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 def on_card(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     """卡片按钮点击回调:确认执行 / 取消。"""
     try:
+        # 鉴权:卡片按钮的操作者也必须在白名单内,防止伪造回调触发执行。
+        operator = data.event.operator
+        op_open_id = operator.open_id if operator else None
+        if not is_allowed_sender(op_open_id):
+            print(f"[on_card] 拒绝未授权操作者 open_id={op_open_id}", flush=True)
+            return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "未授权"}})
+
         value = (data.event.action.value or {}) if data.event.action else {}
         ctx = data.event.context
         chat_id = ctx.open_chat_id if ctx else None
@@ -920,28 +1003,30 @@ pull();setInterval(pull,2000);setInterval(tickElapsed,1000);
 
 
 def _api_tasks():
-    try:
-        with open(RUNNING_FILE, encoding="utf-8") as f:
-            running = json.load(f)
-    except Exception:
-        running = []
     recent = []
-    try:
-        with open(LEDGER_FILE, encoding="utf-8") as f:
-            lines = f.readlines()
-        n = CFG.get("dashboard", {}).get("recent", 50)
-        cut = _cutoff_ts()
-        for ln in lines:
-            try:
-                r = json.loads(ln)
-                if r.get("ts", 0) >= cut:      # 只保留最近 N 天
-                    recent.append(r)
-            except Exception:
-                pass
-        recent = recent[-n:]
-        recent.reverse()  # 最新在前
-    except Exception:
-        pass
+    # 与 task_end 的 append / 裁剪重写同处一把锁,避免读到被重写到一半的 tasks.jsonl。
+    with _LEDGER_LOCK:
+        try:
+            with open(RUNNING_FILE, encoding="utf-8") as f:
+                running = json.load(f)
+        except Exception:
+            running = []
+        try:
+            with open(LEDGER_FILE, encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            lines = []
+    n = CFG.get("dashboard", {}).get("recent", 50)
+    cut = _cutoff_ts()
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+            if r.get("ts", 0) >= cut:      # 只保留最近 N 天
+                recent.append(r)
+        except Exception:
+            pass
+    recent = recent[-n:]
+    recent.reverse()  # 最新在前
     return {"running": running, "recent": recent, "now": time.time()}
 
 

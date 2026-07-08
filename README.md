@@ -35,6 +35,25 @@ cp config.example.json config.json
 
 依赖已装在 `venv/`。首次运行 whisper 会自动下载 small 模型(约 500MB,存到 ~/.cache)。
 
+### ⚠️ 必做:配置发送者白名单(`security.allowed_open_ids`)
+
+机器人带 `--dangerously-skip-permissions` 在你机器上执行任意指令,**必须**只允许你本人。
+`security.allowed_open_ids` **为空 = 拒绝所有消息**(安全默认),配好之前机器人不会响应任何人。
+
+抓自己的 open_id 最省事的办法:先启动 bridge,在飞书里给它随便发一条消息,机器人会回
+`⛔ 未授权`,同时 `bridge.log` 里会打印这条 `拒绝未授权发送者 open_id=ou_xxxx`——把那个 `ou_...`
+填进 `config.json`:
+
+```json
+"security": {
+  "allowed_open_ids": ["ou_你的openid"],
+  "allow_group_chat": false
+}
+```
+
+重启 bridge 即生效。`allow_group_chat` 默认 `false`:只接受私聊,群聊消息一律忽略
+(避免群里其他人发指令或顶替确认)。
+
 ## 三、运行
 
 前台调试:
@@ -69,6 +88,10 @@ launchctl load ~/Library/LaunchAgents/com.<你的名字>.feishu-voice-claude.pli
 - **或打字**:回复「确认/确定/好的/ok」执行,「取消/算了」放弃。
 - 直接发一条**新指令**会覆盖上一条待确认的;确认有效期 5 分钟。
 - 命中 `config.json` 的 `danger.keywords`(删除/覆盖/reset --hard/push -f 等)时,卡片变红并标注 `⚠️ 疑似危险操作`。
+
+> ⚠️ **危险标红只是「尽力提醒」,不是安全控制**。真正执行的是自然语言指令,而红标只做字面关键词匹配——
+> 「挪到废纸篓」「回到三天前」这类不含关键词的破坏性指令**不会**飘红。别把标红当护栏:
+> 每条指令都要自己看清楚再确认。真正的安全边界是上面的**发送者白名单 + 仅私聊**。
 
 **连续对话(带上下文)**:每个「会话 + 项目」维度会续接 Claude 的会话记忆——首次用 `--session-id` 建会话,之后自动 `--resume`,所以可以接着聊:
 
@@ -108,6 +131,8 @@ http://127.0.0.1:8765
 ## 注意
 
 - 本机必须一直开着且 bridge 在跑,它是链路常驻端。
+- **发送者白名单是唯一的安全边界**:`--dangerously-skip-permissions` 让机器人能在你机器上执行任意操作,
+  所以务必配好 `security.allowed_open_ids`(见上「本机配置」),只放行你本人;白名单为空时机器人拒绝所有消息。
 - `claude -p` 默认带 `--dangerously-skip-permissions`(见 config),这样才能无人值守执行操作;
-  危险指令靠上面的关键词确认机制兜底。觉得不放心可去掉该参数,但那样很多操作会被跳过。
+  二次确认 + 关键词标红只是**尽力提醒**,不能替代白名单。觉得不放心可去掉该参数,但那样很多操作会被跳过。
 - 若你的 claude 需要走代理,在 `config.json` 的 `claude.proxy` 填代理地址(默认空 = 不走代理);`claude.bin` 填你本机 claude 可执行文件的绝对路径。

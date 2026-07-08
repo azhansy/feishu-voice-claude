@@ -3,6 +3,10 @@
     "app_id": "cli_填你的AppID",
     "app_secret": "填你的AppSecret"
   },
+  "security": {
+    "allowed_open_ids": [],
+    "allow_group_chat": false
+  },
   "projects_root": "/Users/YOUR_NAME/projects",
   "default_project": "",
   "aliases": {
