@@ -72,7 +72,8 @@ ALLOW_GROUP_CHAT = bool(_SEC.get("allow_group_chat", False))
 def is_allowed_sender(open_id):
     return bool(open_id) and open_id in ALLOWED_OPEN_IDS
 
-# 待确认任务: { chat_id: {"project": str, "instruction": str, "ts": float, "token": str} }
+# 待确认任务:按一次性 token 多槽存放,允许同一会话同时挂多张确认卡片(多项目并发)。
+#   { token: {"chat_id": str, "project": str, "instruction": str, "ts": float} }
 PENDING = {}
 PENDING_TTL = 300  # 秒
 # PENDING 与 LAST_PROJECT 都会被多个消息线程读写,统一用这把锁保护「检查后再改」
@@ -116,40 +117,63 @@ def _session_run_lock(key):
             _SESSION_RUN_LOCKS[key] = lk
         return lk
 
-# 每个会话最近用过的项目,用于「不重复报项目名」的追问
+# 每个会话最近用过的项目,用于「不重复报项目名」的追问。
+# 持久化到 state/last_project.json:bridge 重启后仍记得上次项目,不带项目名的指令直接续用,不再弹选择卡片。
 LAST_PROJECT = {}
+LAST_PROJECT_FILE = os.path.join(HERE, "state", "last_project.json")
 
 
-def set_pending(chat_id, project, instruction, token):
+def _load_last_project():
+    global LAST_PROJECT
+    try:
+        with open(LAST_PROJECT_FILE, encoding="utf-8") as f:
+            LAST_PROJECT = json.load(f)
+    except Exception:
+        LAST_PROJECT = {}
+
+
+def _prune_pending_locked():
+    """清理过期待确认(调用方须持 _PENDING_LOCK)。"""
+    now = time.time()
+    for t in [t for t, p in PENDING.items() if now - p["ts"] >= PENDING_TTL]:
+        PENDING.pop(t, None)
+
+
+def add_pending(chat_id, project, instruction, token):
+    """新增一张待确认卡片(token 唯一,不覆盖已有的其它卡片)。"""
     with _PENDING_LOCK:
-        PENDING[chat_id] = {"project": project, "instruction": instruction,
-                            "ts": time.time(), "token": token}
+        _prune_pending_locked()
+        PENDING[token] = {"chat_id": chat_id, "project": project,
+                          "instruction": instruction, "ts": time.time()}
 
 
-def get_pending(chat_id):
-    """取待确认任务;顺便按 TTL 过期清理。"""
+def pop_pending(token):
+    """按 token 精确弹出(卡片按钮用)。过期或已被消费 -> None。"""
     with _PENDING_LOCK:
-        p = PENDING.get(chat_id)
-        if p and time.time() - p["ts"] >= PENDING_TTL:
-            PENDING.pop(chat_id, None)
-            return None
-        return p
+        _prune_pending_locked()
+        return PENDING.pop(token, None)
 
 
-def pop_pending(chat_id, token=None):
-    """弹出待确认任务;若给了 token 但对不上(重复点击/过期卡片),返回 None 且不弹出。"""
+def latest_pending(chat_id):
+    """取本会话最近一张未过期待确认,返回 (token, entry) 或 (None, None)。
+    文字「确认/取消」不带 token,多卡并存时作用于最近一张;要精确操作请点卡片按钮。"""
     with _PENDING_LOCK:
-        p = PENDING.get(chat_id)
-        if p is None:
-            return None
-        if token is not None and p.get("token") != token:
-            return None
-        return PENDING.pop(chat_id, None)
+        _prune_pending_locked()
+        cand = [(t, p) for t, p in PENDING.items() if p["chat_id"] == chat_id]
+        if not cand:
+            return None, None
+        return max(cand, key=lambda kv: kv[1]["ts"])
 
 
 def set_last_project(chat_id, project):
     with _PENDING_LOCK:
         LAST_PROJECT[chat_id] = project
+        try:
+            os.makedirs(os.path.dirname(LAST_PROJECT_FILE), exist_ok=True)
+            with open(LAST_PROJECT_FILE, "w", encoding="utf-8") as f:
+                json.dump(LAST_PROJECT, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 
 def get_last_project(chat_id):
@@ -400,7 +424,7 @@ def confirm_card(project, instruction, danger, token):
                 {"tag": "button",
                  "text": {"tag": "plain_text", "content": "✖️ 取消"},
                  "type": "default",
-                 "value": {"act": "cancel"}},
+                 "value": {"act": "cancel", "token": token}},
             ]},
             {"tag": "note", "elements": [
                 {"tag": "plain_text", "content": "也可直接回复「确认」/「取消」"}]},
@@ -691,6 +715,21 @@ def run_claude(project, instruction, chat_id=None):
         return out
 
 
+def fmt_dur(seconds):
+    """把秒数转成中文时分秒:45→「45秒」,120→「2分」,90→「1分30秒」,3661→「1小时1分1秒」。"""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}小时")
+    if m:
+        parts.append(f"{m}分")
+    if sec or not parts:      # 不足 1 分钟时至少显示秒
+        parts.append(f"{sec}秒")
+    return "".join(parts)
+
+
 def run_and_reply(message_id, project, instruction, chat_id):
     """确认后统一入口:回执「执行中」→ 跑 claude(其间定时心跳)→ 回结果。
     长任务(claude -p 可能跑几分钟到 30 分钟)期间飞书侧不再是死等。"""
@@ -702,7 +741,7 @@ def run_and_reply(message_id, project, instruction, chat_id):
         t0 = time.time()
         wait = interval
         while interval and not stop.wait(wait):
-            reply(message_id, f"⏳ 还在跑…已 {int(time.time() - t0)}s")
+            reply(message_id, f"⏳ [{project}] 还在跑…已 {fmt_dur(time.time() - t0)}")
             wait = min(wait * 2, 300)   # 逐步退避,30 分钟长任务从约 30 条心跳降到 ~8 条
 
     hb = threading.Thread(target=_beat, daemon=True)
@@ -711,7 +750,7 @@ def run_and_reply(message_id, project, instruction, chat_id):
         out = run_claude(project, instruction, chat_id)
     finally:
         stop.set()
-    reply(message_id, out)
+    reply(message_id, f"📦 [{project}] 结果:\n{out}")
 
 
 # --------------------------------------------------------------------------- #
@@ -722,20 +761,21 @@ def handle_text(message_id, chat_id, text):
     if not text:
         return
 
-    # 1) 若已有待确认任务,先判断这条是确认 / 取消 / 还是新指令
-    pending = get_pending(chat_id)
-    if pending:
-        if is_confirm(text):
-            popped = pop_pending(chat_id)
-            if popped:                       # 可能已被卡片按钮抢先消费,pop 到才执行
-                set_last_project(chat_id, popped["project"])
-                run_and_reply(message_id, popped["project"], popped["instruction"], chat_id)
+    # 1) 文字「确认/取消」作用于本会话最近一张待确认卡片;多卡并存时精确操作请点卡片按钮。
+    #    新指令则「追加」一张卡片(不再覆盖旧的),从而支持多项目并发待确认。
+    if is_confirm(text) or is_cancel(text):
+        token, p = latest_pending(chat_id)
+        if p:
+            if is_confirm(text):
+                popped = pop_pending(token)
+                if popped:                   # 可能已被卡片按钮抢先消费,pop 到才执行
+                    set_last_project(chat_id, popped["project"])
+                    run_and_reply(message_id, popped["project"], popped["instruction"], chat_id)
+                return
+            pop_pending(token)               # is_cancel
+            reply(message_id, f"已取消 [{p['project']}],未执行。")
             return
-        if is_cancel(text):
-            pop_pending(chat_id)
-            reply(message_id, "已取消,未执行任何操作。")
-            return
-        # 其它内容:当作新指令,覆盖旧的待确认任务(继续往下走)
+        # 没有待确认卡片:把「确认/取消」当普通文字继续往下(极少见)
 
     # 2) 不带项目名的重置口令(如「重置上下文」)-> 重置本会话上次用的项目
     if is_reset(text):
@@ -747,7 +787,9 @@ def handle_text(message_id, chat_id, text):
         reply(message_id, f"🧹 已为项目 [{last}] 开启新会话,之后的对话不再带旧上下文。")
         return
 
-    # 3) 解析新指令 -> 一律先复述、等二次确认,绝不直接执行
+    # 3) 解析新指令。确认时机:危险操作 或 切换/新指定项目才弹卡片;
+    #    续用上次项目的普通指令直接执行(如「总结一下今天的提交」)。
+    prev_last = get_last_project(chat_id)   # 本条解析前的「上次项目」,用于判断是否切项目
     project, instruction = match_project(text)
     if not project:
         # 没带项目名:若本会话之前用过某项目,则续用它(整句作为指令)
@@ -771,9 +813,15 @@ def handle_text(message_id, chat_id, text):
         return
 
     set_last_project(chat_id, project)
-    token = str(uuid.uuid4())
-    set_pending(chat_id, project, instruction, token)
-    reply_card(message_id, confirm_card(project, instruction, is_dangerous(instruction), token))
+    danger = is_dangerous(instruction)
+    switching = (project != prev_last)      # 新指定/切换项目(含首次使用)-> 需确认防跑错项目
+    if danger or switching:
+        token = str(uuid.uuid4())
+        add_pending(chat_id, project, instruction, token)
+        reply_card(message_id, confirm_card(project, instruction, danger, token))
+    else:
+        # 续用上次项目的普通指令:直接执行,不再二次确认
+        run_and_reply(message_id, project, instruction, chat_id)
 
 
 def handle_audio(message_id, chat_id, content):
@@ -864,9 +912,9 @@ def on_card(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             instruction = value.get("instruction")
             token = value.get("token")
             # 幂等:凭 token 一次性消费待确认任务;重复点击/打字已确认过 -> pop 不到,直接忽略
-            if chat_id and pop_pending(chat_id, token) is None:
+            if pop_pending(token) is None:
                 return P2CardActionTriggerResponse(
-                    {"toast": {"type": "info", "content": "该任务已处理过了"}})
+                    {"toast": {"type": "info", "content": "该任务已处理过或已过期"}})
             if chat_id:
                 set_last_project(chat_id, project)
 
@@ -890,16 +938,16 @@ def on_card(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             token = str(uuid.uuid4())
             if chat_id:
                 set_last_project(chat_id, project)
-                set_pending(chat_id, project, instruction, token)
+                add_pending(chat_id, project, instruction, token)
             if msg_id:
                 reply_card(msg_id, confirm_card(project, instruction, is_dangerous(instruction), token))
             return P2CardActionTriggerResponse({"toast": {"type": "info", "content": f"已选 {project}"}})
 
-        # 取消
-        if chat_id:
-            pop_pending(chat_id)
+        # 取消:精确弹出这张卡片对应的待确认(cancel 按钮带 token)
+        popped = pop_pending(value.get("token"))
         if msg_id:
-            reply(msg_id, "已取消,未执行任何操作。")
+            proj = (popped or {}).get("project")
+            reply(msg_id, f"已取消 [{proj}],未执行。" if proj else "已取消,未执行任何操作。")
         return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "已取消"}})
     except Exception as e:
         print(f"[on_card] 异常: {e}", flush=True)
@@ -1083,6 +1131,7 @@ def main():
     )
     _load_sessions()
     _load_usage()
+    _load_last_project()
     ledger_startup()
     start_dashboard()
     print("[bridge] 长连接启动,等待飞书消息… (Ctrl+C 退出)", flush=True)
